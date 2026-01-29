@@ -73,19 +73,25 @@ Về **Role Hierarchy**: Hệ thống có 2 role chính:
 
 ---
 
-## Slide 5: Message Flow - Optimistic UI Pattern
+## Slide 5: Complete Message Flow
 
 **Script:**
 
-"Để tạo trải nghiệm người dùng mượt mà, chúng tôi áp dụng Optimistic UI Pattern cho message flow.
+"Slide này mô tả luồng gửi tin nhắn HOÀN CHỈNH, từ khi người dùng nhấn nút 'Gửi' cho đến khi tin nhắn được deliver và xử lý background. Hệ thống được chia làm 4 phases:
 
-Pattern này hoạt động như sau:
+**Phase 1 - OPTIMISTIC UI** (~5ms):
+Ngay lập tức khi người gửi nhấn 'Gửi', giao diện hiển thị tin nhắn với status SENDING. Điều này tạo cảm giác hệ thống phản hồi CỰC NHANH.
 
-**Luồng nhanh** (~50ms): Ngay khi người dùng nhấn nút 'Gửi', giao diện sẽ hiển thị tin nhắn ngay lập tức với status là SENDING. Người dùng không phải chờ đợi.
+**Phase 2 - CRITICAL PATH** (~60ms):
+UI gửi tin nhắn qua Socket.IO hoặc REST API đến Gateway. Gateway trigger event qua EventEmitter. MessageService nhận event và lưu tin nhắn vào PostgreSQL. Quan trọng: Tin nhắn và outbox entry được lưu trong CÙNG MỘT TRANSACTION để đảm bảo data consistency.
 
-**Luồng đầy đủ** (~300ms): Trong khi đó, UI gửi request lên Backend API, Backend lưu tin nhắn vào Database, sau đó trả về response. Khi nhận được response thành công, UI cập nhật status của tin nhắn từ SENDING thành SENT.
+**Phase 3 - REAL-TIME BROADCAST**:
+Khi transaction commit thành công, PostgreSQL trigger NOTIFY event. Redis Pub/Sub nhận event và broadcast đến TẤT CẢ người nhận đang online - bao gồm cả Dashboard của Agent và Widget của Visitor. UI của người gửi cũng nhận confirm và cập nhật status từ SENDING thành SENT.
 
-Lợi ích của pattern này là: Người dùng cảm nhận hệ thống phản hồi rất nhanh, ngay cả khi kết nối mạng chậm. Nếu có lỗi xảy ra, chúng tôi sẽ hiển thị trạng thái failed và cho phép gửi lại."
+**Phase 4 - BACKGROUND PROCESSING** (async):
+Song song với việc broadcast, MessageService enqueue webhook job vào BullMQ. Webhook processor xử lý job này và gửi HTTP POST đến external systems của khách hàng. Phase này chạy hoàn toàn background, KHÔNG ảnh hưởng đến tốc độ chat real-time.
+
+Kết quả: Từ lúc nhấn 'Gửi' đến khi người nhận thấy tin nhắn chỉ mất ~60ms. Webhooks được xử lý sau, không làm chậm trải nghiệm người dùng."
 
 ---
 
@@ -95,15 +101,24 @@ Lợi ích của pattern này là: Người dùng cảm nhận hệ thống ph�
 
 "Bây giờ chúng ta sẽ xem chi tiết luồng xử lý khi Visitor gửi tin nhắn đến Agent.
 
-Luồng này trải qua 6 bước:
-1. **Widget** gửi tin nhắn qua Socket.IO
-2. **Gateway** nhận tin nhắn và phát ra event qua EventEmitter
-3. **BullMQ** nhận event và xử lý bất đồng bộ
-4. Tin nhắn được lưu vào **PostgreSQL**
-5. Sử dụng **Outbox Pattern** kết hợp với NOTIFY trigger của PostgreSQL để đảm bảo exactly-once delivery
-6. Redis Pub/Sub broadcast tin nhắn đến **Dashboard** của các Agent
+Luồng này được chia làm HAI paths:
 
-Toàn bộ luồng này được thiết kế để đảm bảo tin nhắn không bao giờ bị mất, ngay cả khi server crash giữa chừng."
+**Critical Path - Real-time** (~60ms):
+1. **Widget** gửi tin nhắn qua Socket.IO
+2. **Gateway** nhận tin nhắn và phát event qua EventEmitter
+3. **MessageService** xử lý và lưu TRỰC TIẾP vào **PostgreSQL** - không qua queue
+4. **Outbox Pattern** kết hợp NOTIFY trigger đảm bảo exactly-once delivery
+5. **Redis Pub/Sub** broadcast tin nhắn đến **Dashboard** của Agent
+
+Chỉ trong ~60ms, Agent đã thấy tin nhắn!
+
+**Background Path - Không block UX**:
+Sau khi lưu DB, MessageService enqueue job vào **BullMQ** để:
+- Gửi webhook đến external systems
+- Gửi email notifications
+- Process AI chatbot
+
+Thiết kế này đảm bảo: Real-time messaging không bị chậm bởi các background tasks."
 
 ---
 
@@ -111,17 +126,27 @@ Toàn bộ luồng này được thiết kế để đảm bảo tin nhắn khô
 
 **Script:**
 
-"Để hiểu rõ hơn về luồng này, tôi sẽ giải thích vai trò của từng công nghệ:
+"Slide này chia rõ hai paths: Critical Path cho real-time, và Background Path cho các tác vụ không quan trọng.
 
-**Socket.IO** - Bước 1: Cho phép gửi tin nhắn real-time với độ trễ thấp
+**Critical Path** - Đảm bảo real-time (~60ms):
 
-**EventEmitter2** - Bước 2: Giúp decouple các components, Services không cần biết ai sẽ xử lý event của họ
+**Socket.IO**: Gửi tin nhắn với độ trễ cực thấp
 
-**BullMQ** - Bước 3: Xử lý bất đồng bộ, tránh block main thread, hỗ trợ retry tự động nếu có lỗi
+**EventEmitter2**: Decouple components - Gateway không cần biết MessageService sẽ làm gì
 
-**Outbox Pattern** - Bước 4: Đây là pattern quan trọng nhất. Nó đảm bảo exactly-once delivery - nghĩa là tin nhắn được gửi đúng một lần, không bị trùng lặp hay mất mát, ngay cả khi server crash
+**MessageService**: Xử lý business logic và LƯU TRỰC TIẾP vào PostgreSQL. Điểm quan trọng: KHÔNG qua queue, để đảm bảo tốc độ.
 
-**Redis Pub/Sub** - Bước 5: Broadcast tin nhắn đến tất cả server instances trong trường hợp hệ thống scale horizontally"
+**Outbox Pattern**: Đảm bảo exactly-once delivery. Tin nhắn và outbox entry được lưu trong cùng transaction - nếu server crash, không bị mất dữ liệu.
+
+**Redis Pub/Sub**: Broadcast siêu nhanh đến Dashboard. Trong ~60ms kể từ khi visitor gửi, agent đã thấy tin nhắn!
+
+**Background Path** - Không ảnh hưởng UX:
+
+**BullMQ**: Chỉ dùng để queue các background jobs như webhook, email notification.
+
+**Webhook Processor**: Chạy background, có thể mất vài trăm milliseconds nhưng không block chat real-time.
+
+Kiến trúc này balance giữa tốc độ real-time và độ tin cậy."
 
 ---
 
@@ -129,19 +154,23 @@ Toàn bộ luồng này được thiết kế để đảm bảo tin nhắn khô
 
 **Script:**
 
-"Luồng ngược lại - khi Agent trả lời Visitor - có một số điểm khác biệt:
+"Luồng ngược lại - khi Agent trả lời Visitor - được thiết kế với sự phân tách rõ ràng các concerns.
 
-Agent gửi tin nhắn qua **REST API** thay vì Socket.IO, vì Dashboard không cần optimize cho tốc độ như Widget.
+Đầu tiên, Agent gửi tin nhắn qua **REST API** thay vì Socket.IO. Điều này hợp lý vì Dashboard không cần optimize tốc độ gửi như Widget.
 
-**MessageService** thực hiện transaction để lưu tin nhắn vào PostgreSQL, đồng thời lookup **Redis Session** để lấy socketId của visitor đang kết nối.
+**MessageService** thực hiện một transaction phức tạp:
+- Lưu tin nhắn vào PostgreSQL
+- Đồng thời lookup **Redis Session** để lấy socketId của visitor đang online
 
-Sau khi có socketId, MessageService phát event đến **Gateway**.
+Sau khi transaction thành công, điểm quan trọng là MessageService KHÔNG gọi trực tiếp Gateway. Thay vào đó, nó phát event 'agent.message.sent' qua **EventEmitter**.
 
-Gateway thực hiện dual-broadcast:
-- Gửi event 'AGENT_REPLIED' trực tiếp đến **Widget** của visitor cụ thể đó
-- Gửi event 'NEW_MESSAGE' đến các **Other Agents** khác trong cùng project để họ cập nhật dashboard
+**GatewayEventListener** - một component quan trọng mà chúng ta thường bỏ qua - lắng nghe event này thông qua decorator @OnEvent. Component này đóng vai trò bridge giữa business logic layer và WebSocket layer, giúp hệ thống decoupled và dễ maintain.
 
-Thiết kế này đảm bảo tất cả các bên liên quan đều được thông báo kịp thời."
+**EventsGateway** nhận lệnh từ listener và thực hiện dual-broadcast:
+- Gửi event **AGENT_REPLIED** trực tiếp đến Widget của visitor cụ thể (sử dụng socketId đã lookup trước đó)
+- Gửi event **NEW_MESSAGE** đến tất cả **Other Agents** trong project room để họ cập nhật dashboard real-time
+
+Thiết kế này tuân thủ Single Responsibility Principle: MessageService lo business logic, GatewayEventListener lo event handling, EventsGateway lo WebSocket communication."
 
 ---
 
